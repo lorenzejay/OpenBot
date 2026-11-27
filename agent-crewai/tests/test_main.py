@@ -174,6 +174,70 @@ def test_every_system_message_of_the_run_is_kept_for_the_agent():
     assert inputs[main.CALLER_TOOLS_KEY] == []
 
 
+def test_tool_results_name_the_tool_they_answer():
+    """Gemini refuses a function response without the function's name; AG-UI sends only the id."""
+    conversation = [
+        {"role": "user", "content": "Weather in Lisbon and Rome?"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}},
+                {"id": "call-2", "type": "function", "function": {"name": "show_note", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "shown"},
+        {"role": "tool", "tool_call_id": "call-1", "content": "sunny", "name": "kept"},
+        {"role": "tool", "tool_call_id": "call-unknown", "content": "?"},
+    ]
+    original = deepcopy(conversation)
+
+    named = main._with_tool_names(conversation)
+
+    assert [m.get("name") for m in named[2:]] == ["show_note", "kept", None]
+    assert conversation == original
+
+
+def test_gemini_gets_its_own_image_parts_and_unsigned_tool_calls():
+    """CrewAI's Gemini client drops `image_url` parts, and Gemini 3 refuses an unsigned call."""
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/files/cat.jpg?x=1"}},
+                {"type": "text", "text": "What is this?"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Lisbon"}'}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "sunny"},
+    ]
+
+    # Only Gemini's: a strict OpenAI-compatible server refuses a named tool message.
+    assert main._for_provider(conversation, "openai") is conversation
+    assert main._for_provider(conversation, "anthropic") is conversation
+    shaped = main._for_provider(conversation, "google")
+
+    assert shaped[0]["content"] == [
+        {"inlineData": {"mimeType": "image/png", "data": "AAAA"}},
+        {"fileData": {"fileUri": "https://example.com/files/cat.jpg?x=1", "mimeType": "image/jpeg"}},
+        {"type": "text", "text": "What is this?"},
+    ]
+    [part] = shaped[1]["raw_tool_call_parts"]
+    assert part.function_call.name == "get_weather"
+    assert part.function_call.args == {"city": "Lisbon"}
+    assert part.thought_signature == main.GEMINI_UNSIGNED_CALL
+    assert shaped[2] == {**conversation[2], "name": "get_weather"}
+    assert "raw_tool_call_parts" not in conversation[1]
+    assert "name" not in conversation[2]
+
+
 def test_messages_appended_after_validation_serialize_without_a_warning():
     """A live run appends the user message as a dict and CrewAI appends its base message class.
 

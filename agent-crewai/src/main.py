@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import mimetypes
 import os
 import sys
 import threading
@@ -435,6 +436,101 @@ def _with_request_media(conversation: list[dict[str, Any]]) -> list[dict[str, An
     return conversation
 
 
+def _with_tool_names(conversation: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each tool result names the tool it answers, read off the call it answers.
+
+    AG-UI's tool message carries only the call's id. Gemini's function response needs the
+    function's name, and CrewAI's Gemini client reads it from the message, so without it every run
+    after the server ran a tool was refused ("function_response.name: Name cannot be empty").
+    Gemini's only: an OpenAI-compatible server that accepts no field beyond the spec's refuses a
+    tool message that carries a name, and the others go by the id.
+    """
+    names: dict[str, str] = {}
+    named: list[dict[str, Any]] = []
+    for message in conversation:
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            if call.get("id") and function.get("name"):
+                names[call["id"]] = function["name"]
+        if message.get("role") == "tool" and not message.get("name"):
+            name = names.get(message.get("tool_call_id") or "")
+            if name:
+                message = {**message, "name": name}
+        named.append(message)
+    return named
+
+
+def _gemini_part(part: Any) -> Any:
+    """An `image_url` part as the inline data CrewAI's Gemini client reads.
+
+    That client turns only `text`, `inlineData` and `fileData` parts into Gemini parts and drops
+    the rest without a word, so a picture the person sent never reached the model ("No image
+    provided"). A data URL carries its own type; an address is handed over as a file by URI with
+    the type its name implies, which Gemini needs.
+    """
+    if not (isinstance(part, dict) and part.get("type") == "image_url"):
+        return part
+    url = str((part.get("image_url") or {}).get("url") or "")
+    if url.startswith("data:") and ";base64," in url:
+        header, data = url[len("data:") :].split(";base64,", 1)
+        return {"inlineData": {"mimeType": header or "application/octet-stream", "data": data}}
+    if url.startswith(("https://", "http://")):
+        mime_type, _ = mimetypes.guess_type(url.split("?", 1)[0])
+        return {"fileData": {"fileUri": url, "mimeType": mime_type or "image/jpeg"}}
+    return part
+
+
+# Gemini 3 refuses a function call in the history that does not carry the thought signature it was
+# made with ("Function call is missing a thought_signature"). OpenBot runs each tool between two
+# runs, and AG-UI's tool call has no field for a signature, so a call always comes back without
+# its own. Keeping the real one would mean holding it between runs, on whichever replica answered
+# the first. Google documents this value for a history whose signatures are not available.
+GEMINI_UNSIGNED_CALL = b"skip_thought_signature_validator"
+
+
+def _gemini_tool_call_parts(message: dict[str, Any]) -> list[Any]:
+    """The assistant's tool calls as Gemini parts, each carrying the unsigned-call signature.
+
+    CrewAI's Gemini client sends `raw_tool_call_parts` as they are, in place of the parts it would
+    build from `tool_calls` without a signature.
+    """
+    from google.genai import types
+
+    parts = []
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        arguments = function.get("arguments") or {}
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments) if arguments else {}
+            except ValueError:
+                arguments = {}
+        parts.append(
+            types.Part(
+                function_call=types.FunctionCall(
+                    name=str(function.get("name") or ""),
+                    args=arguments if isinstance(arguments, dict) else {},
+                ),
+                thought_signature=GEMINI_UNSIGNED_CALL,
+            )
+        )
+    return parts
+
+
+def _for_provider(conversation: list[dict[str, Any]], provider: str) -> list[dict[str, Any]]:
+    """The conversation in the shape this provider's CrewAI client reads."""
+    if provider != "google":
+        return conversation
+    shaped = []
+    for message in _with_tool_names(conversation):
+        if isinstance(message.get("content"), list):
+            message = {**message, "content": [_gemini_part(part) for part in message["content"]]}
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            message = {**message, "raw_tool_call_parts": _gemini_tool_call_parts(message)}
+        shaped.append(message)
+    return shaped
+
+
 def _agent(tools: list[CallerTool]) -> Agent:
     """The Bot, as a CrewAI Agent, for one turn.
 
@@ -483,7 +579,9 @@ class OpenBotAgentFlow(Flow[OpenBotConversationState]):
         ]
         if not conversation:
             raise ValueError("A turn needs at least one message")
-        conversation = _with_request_media(conversation)
+        conversation = _for_provider(
+            _with_request_media(conversation), bot_settings("agent-crewai").provider
+        )
         hand_back = HandBack()
         tools = _caller_tools(self.state.openbot_caller_tools, hand_back)
         agent = _agent(tools)
