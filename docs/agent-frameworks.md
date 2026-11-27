@@ -165,6 +165,20 @@ app.include_router(router)
 
 Your flow then reads the role and the guidance in `self.state.messages`. Choose **CrewAI** in New Bot.
 
+### A conversational CrewAI Agent
+
+An `Agent(conversational=True)` served with `add_crewai_flow_fastapi_endpoint(..., conversational=True)`
+needs more than the route above. That path drops every system message of a run, not only the first.
+CrewAI also runs an Agent's tools itself, while the tools OpenBot gives a Bot are run by the server.
+The Bot asks for one and the run ends. Finally, the adapter gives each earlier message of the thread a
+new id in its snapshots, so the app shows the conversation twice.
+
+OpenBot's own CrewAI Bot is built this way, and
+[`agent-crewai/src/main.py`](../agent-crewai/src/main.py) handles all three. It keeps the run's system
+messages for the Agent and turns OpenBot's tools into tools that hand the call back. It also keeps
+each message's id. Start from that file and give the Agent your own role, goal and tools. Tools you
+add run in your process as usual.
+
 ## Claude Agent SDK
 
 `ag-ui-claude-sdk` sends Claude only the last message of a run, so the system messages never reach
