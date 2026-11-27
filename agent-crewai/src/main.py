@@ -57,7 +57,14 @@ from crewai.tools import BaseTool
 from crewai.utilities.pydantic_schema_utils import create_model_from_schema
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, PrivateAttr, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    SerializerFunctionWrapHandler,
+    field_serializer,
+    field_validator,
+)
 
 # The one header OpenBot's server sends when it calls a managed Bot. Same name the TypeScript Bots
 # check, because a Bot is a Bot whatever it is written in.
@@ -370,6 +377,33 @@ class OpenBotConversationState(AgentConversationState):
                 for message in value
             ]
         return value
+
+    @field_serializer("messages", mode="wrap")
+    def messages_as_session_messages(
+        self, value: Any, handler: SerializerFunctionWrapHandler
+    ) -> Any:
+        """Messages appended to the list after validation are serialized as session messages too.
+
+        The session's list is appended to in place, which pydantic never sees: the current user
+        message arrives as a plain dict, and CrewAI's own appends are its base `ConversationMessage`.
+        CrewAI serializes the state on every step, so each of those logged a pydantic "serialized value
+        may not be as expected" warning on every run. Coerced here, they serialize as the messages
+        they are, and the list itself is left as it is.
+        """
+        if isinstance(value, list):
+            value = [_session_message(message) for message in value]
+        return handler(value)
+
+
+def _session_message(message: Any) -> Any:
+    """One entry of the session's list, as the message the state declares."""
+    if isinstance(message, OpenBotConversationMessage):
+        return message
+    if isinstance(message, BaseModel):
+        message = message.model_dump()
+    if isinstance(message, dict):
+        return OpenBotConversationMessage.model_validate({"content": None, **message})
+    return message
 
 
 def _with_request_media(conversation: list[dict[str, Any]]) -> list[dict[str, Any]]:

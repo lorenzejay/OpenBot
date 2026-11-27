@@ -174,6 +174,38 @@ def test_every_system_message_of_the_run_is_kept_for_the_agent():
     assert inputs[main.CALLER_TOOLS_KEY] == []
 
 
+def test_messages_appended_after_validation_serialize_without_a_warning():
+    """A live run appends the user message as a dict and CrewAI appends its base message class.
+
+    CrewAI serializes the state on every step, and each of those used to log pydantic's
+    "serialized value may not be as expected" on every run.
+    """
+    import warnings
+
+    from crewai.flow.conversational import ConversationMessage
+
+    state = main.OpenBotConversationState()
+    # Appended the way a run appends them: in place, past validation.
+    session: list = state.messages
+    session.append({"role": "user", "content": "Hello", "metadata": {}, "id": "u1"})
+    session.append(ConversationMessage(role="assistant", content="Hi"))
+    session.append({"role": "assistant", "tool_calls": [], "id": "a2"})
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        dumped = state.model_dump(mode="json")
+        copied = state.model_copy(deep=True).model_dump()
+
+    assert [(m["role"], m["content"], m["id"]) for m in dumped["messages"]] == [
+        ("user", "Hello", "u1"),
+        ("assistant", "Hi", None),
+        ("assistant", None, "a2"),
+    ]
+    assert copied["messages"] == dumped["messages"]
+    # Serializing does not rewrite the session's own list.
+    assert isinstance(state.messages[0], dict)
+
+
 def isolated_environment(directory):
     directory.mkdir(parents=True, exist_ok=True)
     inherited = (
