@@ -26,6 +26,7 @@ import {
   SystemMessage,
   ToolMessage,
 } from "@langchain/core/messages";
+import { GEMINI_UNSIGNED_CALL } from "../../shared/gemini-signatures.ts";
 
 /**
  * The id OpenBot gives a Bot's standing role (`standing-role:<bot id>`, `standingRoleMessage` in the
@@ -395,6 +396,10 @@ export function modelMessages(
  * call is answered in the next run, from the thread. Marked as standard content, the converter
  * sends each call as a `functionCall` part with its thought signature. With no words it has no
  * content at all, since Gemini refuses an empty text part.
+ *
+ * A call the thread brought back without its signature (a server that did not keep it, or a call
+ * another engine made) is given Google's placeholder: Gemini 3 and later refuse an unsigned call
+ * in the current turn. See shared/gemini-signatures.ts.
  */
 export function forGemini(messages: readonly BaseMessage[]): BaseMessage[] {
   return messages.map((message) => {
@@ -404,7 +409,11 @@ export function forGemini(messages: readonly BaseMessage[]): BaseMessage[] {
     return new AIMessage({
       id: ai.id,
       content: ai.content ? ai.content : [],
-      tool_calls: ai.tool_calls,
+      tool_calls: ai.tool_calls.map((call) =>
+        (call as { thoughtSignature?: unknown }).thoughtSignature
+          ? call
+          : { ...call, thoughtSignature: GEMINI_UNSIGNED_CALL },
+      ),
       additional_kwargs: ai.additional_kwargs,
       response_metadata: { ...ai.response_metadata, output_version: "v1" },
     });

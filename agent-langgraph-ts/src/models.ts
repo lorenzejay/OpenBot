@@ -29,6 +29,7 @@ import { ChatOpenAI, ChatOpenAICompletions } from "@langchain/openai";
 // The one rule every Bot in the box decides by, imported rather than copied, so a model OpenAI
 // moves to the Responses API moves here in the same change. Node loads it through the JSON hook in
 // json-modules.ts (see there for why and how).
+import { signingFetch } from "../../shared/gemini-signatures.ts";
 import { requiresResponsesApi } from "../../shared/model-providers.ts";
 import { withContextEditing } from "./context-room.ts";
 import { HarnessRunError, MODEL_UNREACHABLE } from "./errors.ts";
@@ -242,7 +243,9 @@ function openAIModel(model: string, run: RunModel, env: Env): BaseChatModel {
     model,
     apiKey,
     maxRetries: retries(run),
-    ...(baseURL ? { configuration: { baseURL } } : {}),
+    // An address other than OpenAI's may be Gemini's (Google's compatible endpoint, or the gateway
+    // in front of it), which refuses a handed-back call without its thought signature.
+    ...(baseURL ? { configuration: { baseURL, fetch: signingFetch() } } : {}),
   };
   // THE MODEL DECIDES, NOT THE ADDRESS: a gateway in front of OpenAI cannot say which API a model
   // takes. An operator who set COPILOTKIT_OPENAI_API=chat has decided.

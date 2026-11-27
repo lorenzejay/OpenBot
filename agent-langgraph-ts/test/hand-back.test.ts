@@ -612,3 +612,98 @@ for (const [gemini, id] of [
     }
   });
 }
+
+// FOUND ON THE REAL GEMINI API: a call handed back without its signature (a server that did not
+// keep it) is refused on Gemini 3 and later, on Gemini's own API and on Google's OpenAI-compatible
+// endpoint alike. It goes with Google's documented placeholder; any other model's request is sent
+// as it was. See shared/gemini-signatures.ts.
+const UNSIGNED_THREAD = [
+  { id: "u-order", role: "user", content: "What is the status of order 42?" },
+  {
+    id: "a-order",
+    role: "assistant",
+    content: "",
+    toolCalls: [
+      {
+        id: "call_order",
+        type: "function",
+        function: { name: "lookup", arguments: '{"q":"order 42"}' },
+      },
+    ],
+  },
+  {
+    id: "t-order",
+    role: "tool",
+    toolCallId: "call_order",
+    content: "shipped",
+  },
+];
+
+test("Gemini's own API: a call handed back unsigned goes with the placeholder", async () => {
+  const provider = await fakeProvider(always({ text: "It shipped." }));
+  try {
+    const env = {
+      BOT_PROVIDER: "google",
+      GOOGLE_API_KEY: "AIza-test",
+      GOOGLE_GENERATIVE_AI_BASE_URL: `${provider.base}/v1beta`,
+    };
+    const props = { openbotModel: { model: "gemini-4-hydrogen" } };
+    const result = await withEngine({ env }, (base) =>
+      run(
+        base,
+        conversation({
+          messages: UNSIGNED_THREAD,
+          tools: [LOOKUP],
+          forwardedProps: props,
+        }),
+      ),
+    );
+    assert.equal(words(result.events), "It shipped.");
+    const contents = provider.requests[0]!.body.contents as {
+      parts: Record<string, unknown>[];
+    }[];
+    const calls = contents
+      .flatMap((turn) => turn.parts)
+      .filter((part) => "functionCall" in part);
+    assert.equal(calls.length, 1, JSON.stringify(contents));
+    assert.equal(
+      calls[0]!.thoughtSignature,
+      "skip_thought_signature_validator",
+    );
+  } finally {
+    await provider.close();
+  }
+});
+
+for (const [name, model, signed] of [
+  ["a Gemini model", "gemini-3.8-flash", true],
+  ["any other model", "gpt-5.2", false],
+] as const) {
+  test(`OpenBot's gateway, ${name}: a handed-back call ${signed ? "goes with the placeholder" : "is sent as it was"}`, async () => {
+    const provider = await fakeProvider(always({ text: "It shipped." }));
+    try {
+      const env = {
+        BOT_PROVIDER: "openai",
+        BOT_MODEL: model,
+        OPENAI_API_KEY: "test-key",
+        // Google's compatible endpoint is signed by its host; the gateway's path by the same rule.
+        OPENAI_BASE_URL: `${provider.base}/api/model-provider/v1`,
+      };
+      const result = await withEngine({ env }, (base) =>
+        run(base, conversation({ messages: UNSIGNED_THREAD, tools: [LOOKUP] })),
+      );
+      assert.equal(words(result.events), "It shipped.");
+      const call = sentMessages(provider.requests[0]!).find(
+        (message) => message.tool_calls?.length,
+      )!.tool_calls![0] as {
+        extra_content?: { google?: Record<string, unknown> };
+      };
+      assert.equal(
+        call.extra_content?.google?.thought_signature,
+        signed ? "skip_thought_signature_validator" : undefined,
+      );
+    } finally {
+      await provider.close();
+    }
+  });
+}

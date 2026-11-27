@@ -16,6 +16,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared"))
 from model_providers import bot_settings
 from run_model_key import RunModelKey
+import gemini_signatures
+
+# Every Gemini tool call this Bot sends back is signed. See gemini_signatures.py.
+gemini_signatures.install()
 
 from ag_ui_langgraph import add_langgraph_fastapi_endpoint
 from fastapi import FastAPI, Request
