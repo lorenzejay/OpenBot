@@ -522,7 +522,8 @@ async def test_google_provider_reaches_google_genai_boundary(
         {"messages": [{"role": "user", "content": "Say hello."}]}
     )
 
-    assert result["messages"][0].content == "google loopback proof"
+    # A Gemini 3 model answers in content blocks, not a string: read the text either way.
+    assert result["messages"][0].text == "google loopback proof"
     assert captured == [
         {
             "path": "/v1beta/models/gemini-3.8-flash:generateContent",
@@ -534,10 +535,9 @@ async def test_google_provider_reaches_google_genai_boundary(
                         "role": "user",
                     }
                 ],
-                "generationConfig": {
-                    "candidateCount": 1,
-                    "temperature": 0.7,
-                },
+                # langchain-google-genai sends its 0.7 temperature to Gemini 2.5 and none to a
+                # Gemini 3 model, which Google tunes for its own default.
+                "generationConfig": {"candidateCount": 1},
                 "safetySettings": [],
             },
         }
@@ -569,7 +569,8 @@ async def test_google_spec_model_reaches_google_request(
         {"messages": [{"role": "user", "content": "Say hello."}]}
     )
 
-    assert result["messages"][0].content == "google loopback proof"
+    # A Gemini 3 model answers in content blocks, not a string: read the text either way.
+    assert result["messages"][0].text == "google loopback proof"
     assert len(captured) == 1
     assert captured[0]["path"] == "/v1beta/models/gemini-spec-model:generateContent"
 
