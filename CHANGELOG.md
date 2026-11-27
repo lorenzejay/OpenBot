@@ -8,6 +8,11 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+- **A Bot on Google runs Gemini 3.8 Flash when no model is named.** The Google default in
+  `shared/model-providers.json` moves from `gemini-2.5-flash` to `gemini-3.8-flash`. Google no
+  longer serves 2.5 Flash to new API keys, so a Bot left on the default answered its first message
+  with "no longer available to new users". A deployment that sets `BOT_MODEL`, or a conversation
+  that picked a model, keeps that model.
 - **OpenBot Desktop on a Mac asks for your password only after you choose Continue.** When OpenBot
   installs the software it runs on, a card says your Mac will ask for your password and why, and
   macOS's prompt comes up only once you choose Continue. Before, the prompt came up by itself a
