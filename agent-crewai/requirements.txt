@@ -1,4 +1,12 @@
-ag-ui-crewai
+# The Bot is a conversational CrewAI Agent (`Agent(conversational=True)`'s Flow session), which
+# CrewAI shipped in 1.15.45, and ag-ui-crewai serves it with `conversational=True`, which 1.0.0 has.
+# Floors, not pins: CI installs these the way the image does, so a new release upstream is tested
+# before it ships.
+#
+# The extras are CrewAI's own clients for the providers OpenBot offers. CrewAI calls a model it
+# knows through the provider's SDK and refuses to start without it, even with LiteLLM installed.
+crewai[anthropic,google-genai]>=1.15.45
+ag-ui-crewai>=1.0.0
 uvicorn[standard]
 # litellm 1.106.0 imports `CacheableResult` from `mcp.types`, which exists only in mcp 2.x, while
 # ag-ui-crewai 1.0.0 requires mcp<2. The two cannot both be satisfied, so every CrewAI run failed
@@ -8,4 +16,6 @@ uvicorn[standard]
 # Held here rather than raising mcp, because mcp>=2 is only reachable by letting the resolver walk
 # ag-ui-crewai back to 0.3.1 and crewai to 1.6.1. 1.105.1 does not reference the symbol at all and
 # leaves every other version exactly where it was. Lift this when ag-ui-crewai supports mcp 2.
+#
+# Still installed: CrewAI calls a model through LiteLLM when no provider SDK of its own knows it.
 litellm<1.106.0

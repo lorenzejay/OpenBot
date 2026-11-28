@@ -8,6 +8,13 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
+- **The CrewAI Bot is a CrewAI Agent.** A Bot on the CrewAI engine now answers through CrewAI's
+  conversational Agent (`Agent(conversational=True)`, new in CrewAI 1.15.45), served by
+  ag-ui-crewai's conversational mode. Before, it called the model directly from a one-step CrewAI
+  Flow. The Bot's role, the whole thread and OpenBot's tools reach it as they did, and its replies
+  still arrive whole rather than word by word. CrewAI now calls OpenAI, Anthropic and Google models
+  through their own SDKs, and calls any other model through LiteLLM as before.
+
 ## 1.2.2
 
 **Before upgrading.**

@@ -15,7 +15,7 @@ import pytest
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -77,81 +77,14 @@ def test_model_normalizes_blank_provider_and_model_before_defaults(
     assert main._model() == expected
 
 
-def test_crewai_endpoint_preserves_leading_bot_role_for_provider(monkeypatch):
-    monkeypatch.setenv("MANAGED_AGENT_TOKEN", "test-token")
-    provider_messages = []
-    provider_tools = []
-
-    async def record_completion(*, model, messages, tools, stream):
-        provider_messages.append(deepcopy(messages))
-        provider_tools.append(deepcopy(tools))
-        return FakeCompletion()
-
-    monkeypatch.setattr(main, "acompletion", record_completion)
-
-    client = TestClient(main.app)
-    response = client.post(
-        "/",
-        headers={"x-openbot-agent-token": "test-token"},
-        json=run_input(
-            [
-                {
-                    "id": "system-1",
-                    "role": "system",
-                    "content": "You are Ada, a Bot-specific finance analyst.",
-                },
-                {
-                    "id": "user-1",
-                    "role": "user",
-                    "content": "What should I review first?",
-                },
-            ]
-        ),
-    )
-
-    assert response.status_code == 200
-    assert provider_messages == [
-        [
-            {
-                "role": "system",
-                "content": "You are Ada, a Bot-specific finance analyst.",
-            },
-            {
-                "role": "user",
-                "content": "What should I review first?",
-            },
-        ]
-    ]
-    assert provider_tools == [None]
-    snapshots = [
-        event["messages"]
-        for event in agui_events(response.text)
-        if event.get("type") == "MESSAGES_SNAPSHOT"
-    ]
-    assert snapshots
-    assert snapshots[-1][:2] == [
-        {
-            "id": "system-1",
-            "role": "system",
-            "content": "You are Ada, a Bot-specific finance analyst.",
-        },
-        {
-            "id": "user-1",
-            "role": "user",
-            "content": "What should I review first?",
-        },
-    ]
-
-
-def test_provider_message_projection_keeps_supported_fields_without_mutating_state():
+def test_session_messages_are_projected_to_provider_fields_without_mutating_state():
+    """What the Agent is given is what a strict provider accepts; the session keeps the rest."""
     original_messages = [
         {
             "id": "system-1",
             "role": "system",
             "content": "System instructions",
-            "name": "system_name",
             "metadata": {"transport": "ag-ui"},
-            "encrypted_value": "system-secret",
         },
         {
             "id": "user-1",
@@ -166,7 +99,6 @@ def test_provider_message_projection_keeps_supported_fields_without_mutating_sta
         {
             "id": "assistant-1",
             "role": "assistant",
-            "content": None,
             "name": "assistant_name",
             "tool_calls": [
                 {
@@ -189,14 +121,10 @@ def test_provider_message_projection_keeps_supported_fields_without_mutating_sta
     ]
     state_messages = deepcopy(original_messages)
 
-    projected = main._provider_messages(state_messages)
+    projected = [main._message_dict(message) for message in state_messages]
 
     assert projected == [
-        {
-            "role": "system",
-            "content": "System instructions",
-            "name": "system_name",
-        },
+        None,
         {
             "role": "user",
             "content": [
@@ -207,6 +135,7 @@ def test_provider_message_projection_keeps_supported_fields_without_mutating_sta
         },
         {
             "role": "assistant",
+            "content": None,
             "name": "assistant_name",
             "tool_calls": [
                 {
@@ -223,6 +152,122 @@ def test_provider_message_projection_keeps_supported_fields_without_mutating_sta
         },
     ]
     assert state_messages == original_messages
+
+
+def test_every_system_message_of_the_run_is_kept_for_the_agent():
+    """ag-ui-crewai's conversational path drops system messages; the Bot's role is among them."""
+    from ag_ui.core import SystemMessage, UserMessage
+
+    inputs = main.crewai_endpoint.crewai_prepare_inputs(
+        state={},
+        messages=[
+            SystemMessage(id="standing-role:bot", role="system", content="You are Ada."),
+            SystemMessage(id="granted-tools:bot", role="system", content="You hold: notes."),
+            UserMessage(id="u1", role="user", content="Hello"),
+        ],
+        tools=[],
+        context=[],
+        forwarded_props={},
+    )
+
+    assert inputs[main.INSTRUCTIONS_KEY] == ["You are Ada.", "You hold: notes."]
+    assert inputs[main.CALLER_TOOLS_KEY] == []
+
+
+def test_tool_results_name_the_tool_they_answer():
+    """Gemini refuses a function response without the function's name; AG-UI sends only the id."""
+    conversation = [
+        {"role": "user", "content": "Weather in Lisbon and Rome?"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}},
+                {"id": "call-2", "type": "function", "function": {"name": "show_note", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "shown"},
+        {"role": "tool", "tool_call_id": "call-1", "content": "sunny", "name": "kept"},
+        {"role": "tool", "tool_call_id": "call-unknown", "content": "?"},
+    ]
+    original = deepcopy(conversation)
+
+    named = main._with_tool_names(conversation)
+
+    assert [m.get("name") for m in named[2:]] == ["show_note", "kept", None]
+    assert conversation == original
+
+
+def test_gemini_gets_its_own_image_parts_and_unsigned_tool_calls():
+    """CrewAI's Gemini client drops `image_url` parts, and Gemini 3 refuses an unsigned call."""
+    conversation = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/files/cat.jpg?x=1"}},
+                {"type": "text", "text": "What is this?"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Lisbon"}'}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "sunny"},
+    ]
+
+    # Only Gemini's: a strict OpenAI-compatible server refuses a named tool message.
+    assert main._for_provider(conversation, "openai") is conversation
+    assert main._for_provider(conversation, "anthropic") is conversation
+    shaped = main._for_provider(conversation, "google")
+
+    assert shaped[0]["content"] == [
+        {"inlineData": {"mimeType": "image/png", "data": "AAAA"}},
+        {"fileData": {"fileUri": "https://example.com/files/cat.jpg?x=1", "mimeType": "image/jpeg"}},
+        {"type": "text", "text": "What is this?"},
+    ]
+    [part] = shaped[1]["raw_tool_call_parts"]
+    assert part.function_call.name == "get_weather"
+    assert part.function_call.args == {"city": "Lisbon"}
+    assert part.thought_signature == main.GEMINI_UNSIGNED_CALL
+    assert shaped[2] == {**conversation[2], "name": "get_weather"}
+    assert "raw_tool_call_parts" not in conversation[1]
+    assert "name" not in conversation[2]
+
+
+def test_messages_appended_after_validation_serialize_without_a_warning():
+    """A live run appends the user message as a dict and CrewAI appends its base message class.
+
+    CrewAI serializes the state on every step, and each of those used to log pydantic's
+    "serialized value may not be as expected" on every run.
+    """
+    import warnings
+
+    from crewai.flow.conversational import ConversationMessage
+
+    state = main.OpenBotConversationState()
+    # Appended the way a run appends them: in place, past validation.
+    session: list = state.messages
+    session.append({"role": "user", "content": "Hello", "metadata": {}, "id": "u1"})
+    session.append(ConversationMessage(role="assistant", content="Hi"))
+    session.append({"role": "assistant", "tool_calls": [], "id": "a2"})
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        dumped = state.model_dump(mode="json")
+        copied = state.model_copy(deep=True).model_dump()
+
+    assert [(m["role"], m["content"], m["id"]) for m in dumped["messages"]] == [
+        ("user", "Hello", "u1"),
+        ("assistant", "Hi", None),
+        ("assistant", None, "a2"),
+    ]
+    assert copied["messages"] == dumped["messages"]
+    # Serializing does not rewrite the session's own list.
+    assert isinstance(state.messages[0], dict)
 
 
 def isolated_environment(directory):
@@ -286,18 +331,55 @@ def stop_loopback_server(server, thread):
     assert not thread.is_alive(), "loopback server did not stop"
 
 
+def as_stream(completion):
+    """A Chat Completions answer as the SSE stream a streamed request gets."""
+    message = completion["choices"][0]["message"]
+    delta = {key: value for key, value in message.items() if value is not None}
+    for index, call in enumerate(delta.get("tool_calls") or []):
+        call["index"] = index
+    base = {
+        "id": completion["id"],
+        "object": "chat.completion.chunk",
+        "created": completion["created"],
+        "model": completion["model"],
+    }
+    chunks = [
+        {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+        {
+            **base,
+            "choices": [
+                {"index": 0, "delta": {}, "finish_reason": completion["choices"][0]["finish_reason"]}
+            ],
+        },
+        {**base, "choices": [], "usage": completion["usage"]},
+    ]
+
+    async def stream():
+        for chunk in chunks:
+            yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
 def loopback_openai_receiver(records, strict_messages=False):
     app = FastAPI()
 
     @app.post("/chat/completions")
     async def chat_completions(request: Request):
         body = await request.json()
+        completion = answer(body, request.headers)
+        if isinstance(completion, dict) and body.get("stream"):
+            return as_stream(completion)
+        return completion
+
+    def answer(body, headers):
         records.append(
             {
                 "model": body.get("model"),
                 "messages": body.get("messages"),
                 "tools": body.get("tools"),
-                "authorization": request.headers.get("authorization"),
+                "authorization": headers.get("authorization"),
             }
         )
         if not body.get("model"):
@@ -343,7 +425,7 @@ def loopback_openai_receiver(records, strict_messages=False):
                             },
                             status_code=400,
                         )
-        if body.get("tools") == [show_note_provider_tool()] and not any(
+        if provider_tool_shapes(body.get("tools")) == [show_note_shape()] and not any(
             message.get("role") == "tool" for message in body.get("messages") or []
         ):
             return {
@@ -457,7 +539,7 @@ def agui_events(response_text):
     return events
 
 
-def run_litellm_loopback_proof(proof_case, output):
+def run_loopback_proof(proof_case, output):
     sys.addaudithook(prohibit_external_connections)
     provider, model, expected_provider_model, expected_receiver_model = {
         "blank-provider": ("   ", "gpt-4o", "openai/gpt-4o", "gpt-4o"),
@@ -580,12 +662,23 @@ def run_litellm_loopback_proof(proof_case, output):
     assert not result["runError"], result
     assert len(records) == (2 if proof_case == "caller-tool" else 1), result
     assert all(record["model"] == expected_receiver_model for record in records), result
-    assert records[0]["messages"][0] == {
+    # CrewAI's own system prompt for the Agent, then the Bot's role as the server sent it.
+    assert records[0]["messages"][0]["role"] == "system", result
+    assert records[0]["messages"][1] == {
         "role": "system",
         "content": "You are Ada, a Bot-specific finance analyst.",
     }, result
     if proof_case == "caller-tool":
-        assert records[0]["tools"] == [show_note_provider_tool()], result
+        assert provider_tool_shapes(records[0]["tools"]) == [show_note_shape()], result
+        # Handed back, not run: no result on the wire and none in the thread, and the one call the
+        # snapshot asks for is the model's own.
+        assert "TOOL_CALL_RESULT" not in result["eventTypes"], result
+        assert "TOOL_CALL_START" not in result["eventTypes"], result
+        first_snapshot = result["messagesSnapshots"][-1]
+        assert not [m for m in first_snapshot if m["role"] == "tool"], result
+        assert [call["id"] for m in first_snapshot for call in m.get("toolCalls") or []] == [
+            "call_show_note_1"
+        ], result
         assert result["decodedToolCall"] == {
             "id": "call_show_note_1",
             "type": "function",
@@ -596,8 +689,8 @@ def run_litellm_loopback_proof(proof_case, output):
         }, result
         assert result["secondStatusCode"] == 200, result
         assert "RUN_FINISHED" in result["secondEventTypes"], result
-        assert records[1]["tools"] == [show_note_provider_tool()], result
-        assert records[1]["messages"][-2:] == [
+        assert provider_tool_shapes(records[1]["tools"]) == [show_note_shape()], result
+        assert without_empty_content(records[1]["messages"][-2:]) == [
             {
                 "role": "assistant",
                 "tool_calls": [
@@ -620,28 +713,72 @@ def run_litellm_loopback_proof(proof_case, output):
         assert result["messagesSnapshots"][-1][-1]["toolCalls"][0]["id"] == "call_show_note_1"
     elif proof_case == "strict-projection":
         assert_provider_messages_are_projected(records[0]["messages"])
-        assert records[0]["messages"][1] == {
+        # The picture reaches the model, just before the question CrewAI makes the request.
+        assert records[0]["messages"][2] == {
             "role": "user",
             "content": [
-                {"type": "text", "text": "What should I review first?"},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
             ],
             "name": "analyst",
         }, result
+        assert records[0]["messages"][3]["role"] == "user", result
+        assert "What should I review first?" in records[0]["messages"][3]["content"], result
+        assert without_empty_content(records[0]["messages"][4:]) == [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"symbol\":\"ACME\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "Synthetic result", "tool_call_id": "call-1"},
+        ], result
+        # Every message of the thread keeps the id it arrived under, so the snapshot replaces the
+        # client's copies instead of adding the thread again under new ones. It carries no system
+        # message, which leaves the client's as they are.
         snapshot = result["messagesSnapshots"][-1]
-        assert [message["id"] for message in snapshot[:4]] == [
-            "system-1",
+        assert [message["id"] for message in snapshot[:3]] == [
             "user-1",
             "assistant-1",
             "tool-1",
         ], result
-        assert snapshot[2]["toolCalls"][0]["id"] == "call-1", result
-        assert snapshot[3]["toolCallId"] == "call-1", result
+        assert not [message for message in snapshot if message["role"] == "system"], result
+        assert snapshot[1]["toolCalls"][0]["id"] == "call-1", result
+        assert snapshot[2]["toolCallId"] == "call-1", result
     else:
-        assert records[0]["messages"][1] == {
-            "role": "user",
-            "content": "What should I review first?",
-        }, result
+        assert records[0]["messages"][2]["role"] == "user", result
+        assert "What should I review first?" in records[0]["messages"][2]["content"], result
+
+
+def without_empty_content(messages):
+    """CrewAI sends `content: null` on a message that only calls tools; the old harness left it out."""
+    return [
+        {key: value for key, value in message.items() if not (key == "content" and value is None)}
+        for message in messages
+    ]
+
+
+def show_note_shape():
+    return {
+        "name": "show_note",
+        "properties": {"title"},
+        "required": ["title"],
+    }
+
+
+def provider_tool_shapes(tools):
+    """The tools the model was offered, by what matters: CrewAI writes its own schema around them."""
+    return [
+        {
+            "name": tool["function"]["name"],
+            "properties": set(tool["function"]["parameters"]["properties"]),
+            "required": tool["function"]["parameters"].get("required"),
+        }
+        for tool in tools or []
+    ]
 
 
 def basic_messages():
@@ -733,7 +870,7 @@ def assert_provider_messages_are_projected(messages):
     "proof_case",
     ["blank-provider", "blank-model", "strict-projection", "namespaced-model", "gateway-model"],
 )
-def test_crewai_endpoint_uses_normalized_model_with_real_litellm_loopback(
+def test_crewai_endpoint_uses_normalized_model_with_real_provider_loopback(
     tmp_path, proof_case
 ):
     output = tmp_path / f"{proof_case}.json"
@@ -791,4 +928,4 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
-    run_litellm_loopback_proof(arguments.proof_case, arguments.output)
+    run_loopback_proof(arguments.proof_case, arguments.output)
