@@ -27,6 +27,10 @@ import {
 import { ChannelWorkRows } from "@/components/channels/channel-work";
 import { attachmentModality } from "@/components/channels/chat-messages";
 import { toAgentOptions } from "@/components/channels/composer";
+import {
+  forgetFirstMessage,
+  putBackFirstMessage,
+} from "@/components/channels/composer/kept-first-message";
 import { ModelPicker } from "@/components/channels/composer/model-picker";
 import { StillWorkingError } from "@/components/channels/composer/queue";
 import { ConversationIntro } from "@/components/channels/conversation-intro";
@@ -65,7 +69,7 @@ import {
   refusedTurnsQueryOptions,
 } from "@/lib/channels/queries";
 import { withRefusedTurns } from "@/lib/channels/refused-turns";
-import { runReply } from "@/lib/channels/run-reply";
+import { rosterLineMatches, runReply } from "@/lib/channels/run-reply";
 import { onBotSaidOffTheList } from "@/lib/channels/said-off-the-list";
 import { turnDidWork } from "@/lib/channels/turn-did-work";
 import {
@@ -87,10 +91,21 @@ import {
 } from "@/lib/copilot/approval-context";
 import { offerItsOwnTools } from "@/lib/copilot/bot-offer";
 import { isBrokenStream, STREAM_BROKE } from "@/lib/copilot/broken-stream";
+import {
+  endsOnStep,
+  followCarriedRun,
+  followServerTurn,
+  isTurnWork,
+  serverCarriesTurn,
+  stopCarriedTurn,
+  turnAnswered,
+  waitsOnPerson,
+} from "@/lib/copilot/carried-turn";
 import { ConversationProvider } from "@/lib/copilot/conversation";
 import { afterMs, joinWithin } from "@/lib/copilot/join-thread";
 import {
   askRunEnding,
+  askRunGoing,
   askRunLiveness,
   quietRunPeriod,
   RUN_ENDED_UNHEARD,
@@ -112,6 +127,7 @@ import {
   laterRunFailure,
   laterRunReason,
   refusedForPerson,
+  refusedRun,
   requestNotMade,
   stoppedReason,
   TURN_CUT_OFF,
@@ -193,9 +209,34 @@ function rosterSaysWorking(channelId: string): boolean {
 }
 
 /**
+ * Resolves when the roster next changes (the socket patched it, or it was read again), or after `ms`.
+ */
+function nextRosterChange(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      unsubscribe();
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    const listKey = JSON.stringify(channelKeys.list());
+    const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
+      if (
+        event.type === "updated" &&
+        JSON.stringify(event.query.queryKey) === listKey
+      )
+        done();
+    });
+  });
+}
+
+/**
  * Backstop for a message typed before the runtime agent exists; it must not be discarded.
  */
 const SEND_WITHOUT_RUNTIME_AFTER_MS = 1500;
+
+/** What a Stop the server didn't take says, under the turn that goes on. */
+const STOP_FAILED = "Couldn't stop the Bot. Try again.";
 
 /** What a turn that never left the browser says, with the person's words back in the box. */
 const NOT_SENT = "Your message wasn't sent. Try again.";
@@ -463,6 +504,25 @@ function moreCalls(live: ToolCalls, stored: ToolCalls): ToolCalls {
   return stored.length > calls.length || longer ? stored : undefined;
 }
 
+/**
+ * Whether merging `stored` would put its copy of a Bot's words in place of the screen's: a reply the
+ * store holds otherwise than the screen, and not as the start of it (`mergeStoredMessages`).
+ */
+function rewritesReply(local: Message[], stored: Message[]): boolean {
+  const storedById = new Map(stored.map((message) => [message.id, message]));
+  return local.some((message) => {
+    const copy = storedById.get(message.id);
+    return (
+      message.role === "assistant" &&
+      copy?.role === "assistant" &&
+      typeof message.content === "string" &&
+      typeof copy.content === "string" &&
+      copy.content !== message.content &&
+      !message.content.startsWith(copy.content)
+    );
+  });
+}
+
 /** How long a read-back waits before each read of the stored thread. */
 const READ_BACK_DELAYS_MS = [250, 750, 1500, 3000];
 
@@ -662,6 +722,7 @@ export function ChannelChat({
    */
   const [first] = useState(() => {
     const pending = takeFirstMessage(channel.id);
+    // A first message an earlier page kept is decided on once the thread has been read (the join).
     if (!pending) return null;
     const attachments = [...pending.attachments];
     // Drawn with its files, as `deliver` will send it, so they do not appear only once it runs.
@@ -676,6 +737,17 @@ export function ChannelChat({
     return { seed, text: pending.text, attachments };
   });
   const seed = first?.seed ?? null;
+
+  /*
+   * A CONVERSATION THIS PAGE HAS JUST MADE SENDS ITS FIRST MESSAGE AT ONCE. Its thread is new, so
+   * there is nothing to join, no history to read and no voice chat to bring in, and waiting for them
+   * held the message in this page for a second or two after it showed as sent. A phone locked or a
+   * tab closed in that time lost it: the conversation was made, and opened later empty, with no run
+   * in its thread. So the first message leaves before any of that (`deliver`), and the join is not
+   * made at all (the join effect): the run streams the turn here itself.
+   */
+  const fresh = first !== null;
+  const firstOfFresh = useRef(fresh);
 
   /** Cleared by the send-on-mount effect without restarting it. */
   const seedRef = useRef(first);
@@ -753,6 +825,18 @@ export function ChannelChat({
    */
   const [replaying, setReplaying] = useState(false);
   /**
+   * The stored history, read alongside the join and drawn while the join replays the thread.
+   *
+   * A slow replay used to leave a conversation that already had something to show blank until the
+   * replay was over. It is kept here rather than on the agent because the join empties the agent
+   * when it starts, and anything put on the agent before the replay ends has its replayed text
+   * appended to it a second time. It is let go when the join turns out to carry the Bot's answer,
+   * and otherwise only once the history that replaces it is on the agent: let go when the join
+   * ended, it left the half-replayed agent on screen until that read landed, and the history then
+   * came back as if it had just arrived, every reply typed out again.
+   */
+  const [earlyHistory, setEarlyHistory] = useState<Message[] | null>(null);
+  /**
    * How many stored turns this app could not read.
    *
    * Held rather than derived, because the transcript is the running agent's once history is handed
@@ -805,6 +889,11 @@ export function ChannelChat({
    * so a replay is never laid over messages already on screen.
    */
   const [joins, setJoins] = useState(0);
+  /**
+   * How many times the message box has been opened again: once for a first message put back after
+   * it first opened, which it reads from its draft only as it opens.
+   */
+  const [composerOpenings, setComposerOpenings] = useState(0);
   const unanswered = useRef(false);
   const connection = useConnectionLost();
   useReconnected(() => {
@@ -814,15 +903,52 @@ export function ChannelChat({
     else pullHistoryRef.current?.();
   });
 
-  // Join the gateway socket, restore durable history, then release the first-message gate.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: `joins` is the join asked for again when OpenBot answers again.
+  // Join the gateway socket, restore durable history, then release the first-message gate. `joins`
+  // is the join asked for again when OpenBot answers again.
   useEffect(() => {
     if (!isReady) return;
+    // Just made here: nothing to join or read, and the first message is not held for it (`fresh`).
+    // Asked again when OpenBot answers again (`joins`), it is joined as any conversation is.
+    if (fresh && joins === 0) {
+      openJoined.current();
+      openJoinGate.current();
+      return;
+    }
     let current = true;
     const version = ++historyReadVersion.current;
     // Before the connect: it is handed the subscribers the agent has when it starts.
     const lastRun = followLastRun(agent);
     setReplaying(true);
+    /*
+     * THE STORED HISTORY IS ASKED FOR WITH THE JOIN, NOT AFTER IT, so a conversation shows what it
+     * holds while a slow replay is still on its way. Only drawn from `earlyHistory`, never set on the
+     * agent: see there. Not drawn once the join has found the Bot answering, whose replay is then the
+     * screen's, nor once the join is over, nor when a later read has taken over the notice.
+     */
+    let joinOver = false;
+    let answering = false;
+    // This run's stored copy is on screen, so the cleanup has it to take down.
+    let earlyUp = false;
+    const early = readThreadMessages(channel.threadId, runtimeAgentId);
+    void early.then((stored) => {
+      if (
+        current &&
+        !joinOver &&
+        !answering &&
+        version === historyReadVersion.current &&
+        stored.availability === "ready"
+      ) {
+        // A read that worked owns the notice, or an earlier failure is said above the history.
+        setUnreadable(stored.unreadable);
+        setHistoryAvailability("ready");
+        setHistoryReadFailed(false);
+        // An empty store has nothing to show early: the conversation goes on loading as before.
+        if (stored.messages.length === 0) return;
+        earlyUp = true;
+        setEarlyHistory(withCurrentA2uiVersions(stored.messages));
+        setRestoring(false);
+      }
+    });
 
     void (async () => {
       let joined: "connected" | "deadline" | "gave up" = "deadline";
@@ -860,9 +986,12 @@ export function ChannelChat({
               answerMs: JOIN_LIVENESS_MS,
             })) !== "unreachable",
           onAnswering: () => {
+            answering = true;
             if (current) {
+              earlyUp = false;
               setRestoring(false);
               setReplaying(false);
+              setEarlyHistory(null);
             }
           },
           /*
@@ -906,6 +1035,8 @@ export function ChannelChat({
         stopKept();
         keptRunId = lastRun.runId();
         lastRun.stop();
+        joinOver = true;
+        // The stored copy stays up until the history below is on the agent: see `earlyHistory`.
         if (current) setReplaying(false);
         openJoined.current();
       }
@@ -913,16 +1044,26 @@ export function ChannelChat({
        * The turn the join was kept for had ended without a word reaching here: say so, unless the
        * server says its run finished. Its reply is then the one the history read below brings in.
        */
+      // What this join said of a turn that ended unheard, for a turn it then finds went on.
+      let saidStopped: Failure | null = null;
       if (keptEnded !== null && current && turnsRef.current === 0) {
         setRestoring(false);
         const finished =
           keptEnded === "over" &&
           keptRunId !== null &&
           (await askRunEnding(channel.id, keptRunId)) === "finished";
-        if (!finished && current && turnsRef.current === 0)
-          setRunError({
+        // Not a turn the server says it is still carrying on: see `carriedByServer`.
+        if (
+          !finished &&
+          current &&
+          turnsRef.current === 0 &&
+          !carriedByServerRef.current
+        ) {
+          saidStopped = {
             message: keptEnded === "over" ? RUN_ENDED_UNHEARD : RUN_UNREACHABLE,
-          });
+          };
+          setRunError(saidStopped);
+        }
       }
       /*
        * The last run failed, so say so again, as the turn did when it failed. Only from a replay
@@ -944,10 +1085,41 @@ export function ChannelChat({
        */
       let askAgain = false;
       try {
-        const stored = await readThreadMessages(
-          channel.threadId,
-          runtimeAgentId,
-        );
+        /*
+         * The read taken with the join, when it worked and the join was not kept for a turn still
+         * going, which has added to the store since. Not `keptRunId`, which names the last run the
+         * replay heard start, finished or not, and so is set for nearly every thread.
+         */
+        const held = answering ? null : await early;
+        /*
+         * IT IS OLDER THAN THE REPLAY, so it stands in for a read after it only where merging it
+         * changes no reply the replay drew. A turn still going when it was taken is in it only in
+         * part, and where the replay drew that reply in pieces (the gateway drops some), the
+         * store's copy wins the merge: the reply was left cut short at the early read's part.
+         * Such a read is the screen's only when the store can't be read again.
+         */
+        const usable =
+          held?.availability === "ready" &&
+          !(
+            joined === "connected" &&
+            rewritesReply(agent.messages, held.messages)
+          )
+            ? held
+            : null;
+        /*
+         * A replay that finished leaves nothing the usable read lacks. One cut short at the
+         * deadline is followed by a read of the store, as it was before there was an early read,
+         * since a turn that ended just before opening can be missing from the early one.
+         */
+        const fresh =
+          joined === "connected" && usable !== null
+            ? usable
+            : await readThreadMessages(channel.threadId, runtimeAgentId);
+        // A read that worked counts: one failing after it does not say the history is lost.
+        const stored =
+          fresh.availability === "unavailable" && usable !== null
+            ? usable
+            : fresh;
         const isCurrent = current && version === historyReadVersion.current;
         if (isCurrent) {
           // The gateway snapshot can lag the store. Keep its valid local rows even when the
@@ -975,19 +1147,91 @@ export function ChannelChat({
           setUnreadable(stored.unreadable);
           setHistoryAvailability("ready");
           setHistoryReadFailed(false);
+          /*
+           * A FIRST MESSAGE AN EARLIER PAGE KEPT GOES BACK IN THE BOX ONLY IF THE SERVER NEVER GOT IT.
+           * Its page can die after the server has started the run and before the run's start reaches
+           * it, and the words then came back under their own answer, asking to be sent twice. So it is
+           * decided now the thread has been read: a message of the person's in it, stored or
+           * replayed by the join, is the server having it (a run it took carries the message), and
+           * the kept copy is let go. See `kept-first-message.ts`.
+           */
+          const delivered =
+            stored.messages.some((message) => message.role === "user") ||
+            agent.messages.some((message) => message.role === "user");
+          if (putBackFirstMessage(channel.id, delivered))
+            setComposerOpenings((count) => count + 1);
         }
       } finally {
         // Cleared on failure too: placeholders over an empty transcript promise messages that are
-        // never coming.
-        if (current) setRestoring(false);
+        // never coming. The stored copy goes in the same commit as the history takes its place.
+        if (current) {
+          earlyUp = false;
+          setRestoring(false);
+          setEarlyHistory(null);
+        }
         // Release even on join/restore failure; the gate orders messages, not withholds them.
         openJoinGate.current();
       }
       if (askAgain && current) pullHistoryRef.current?.();
+      /*
+       * A TURN THE SERVER IS STILL CARRYING ON IS FOLLOWED FROM HERE. The join above streams the run
+       * going when the conversation opened, and ends with it; the server then carries the turn on in
+       * a run of its own past one run's step limit or deadline (`carried-turn.ts`). Opened part way
+       * through such a turn, the conversation showed the steps up to there, no working dot and no
+       * answer, until it was opened again. So a turn the Bot has not answered asks the server for a
+       * run going, and follows each one to the answer, saying it is working while it does.
+       */
+      if (
+        current &&
+        turnsRef.current === 0 &&
+        keptEnded !== "unreachable" &&
+        !turnAnswered(agent.messages) &&
+        !waitsOnPerson(agent)
+      ) {
+        let following = false;
+        const followed = await followServerTurn({
+          agent,
+          conversationId: channel.id,
+          heard: keptRunId,
+          join: () => {
+            if (!following) {
+              following = true;
+              void setChannelBusy({ channelId: channel.id, busy: true });
+            }
+            return whileObserved(agent, () =>
+              copilotkit.connectAgent({ agent }),
+            );
+          },
+          quietMs: quietRunPeriod.ms,
+          stopped: () => !current || turnsRef.current > 0,
+        });
+        if (following && turnsRef.current === 0)
+          void setChannelBusy({ channelId: channel.id, busy: false });
+        // A turn this join said had stopped went on to its answer: it no longer says so.
+        if (
+          followed !== null &&
+          saidStopped !== null &&
+          current &&
+          (await askRunEnding(channel.id, followed)) === "finished"
+        ) {
+          const said = saidStopped;
+          setRunError((shown) => (shown === said ? null : shown));
+        }
+      }
     })();
 
     return () => {
       current = false;
+      /*
+       * A join given up part way (the agent changed, the runtime stopped being ready) takes its
+       * stored copy down with it, or the screen kept it, read-only, until a join that might not
+       * come. What was loading goes on loading, as it did before the stored copy was drawn.
+       */
+      setReplaying(false);
+      if (earlyUp) {
+        setEarlyHistory(null);
+        setRestoring(true);
+      }
     };
   }, [
     copilotkit,
@@ -997,6 +1241,7 @@ export function ChannelChat({
     channel.threadId,
     runtimeAgentId,
     joins,
+    fresh,
   ]);
 
   /*
@@ -1147,12 +1392,30 @@ export function ChannelChat({
       pull();
     });
     pullHistoryRef.current = pull;
+    /*
+     * THE BOT'S LINE THE ROSTER HAD ON OPENING IS READ FOR ONLY WHEN OPENING DIDN'T BRING IT. Opening
+     * reads the store with the join, so reading it again for that line read the same history three
+     * more times over the retries, which go on while a read brings nothing new, as it nearly never
+     * does. The conversation list keeps the reply as plain text on one line, cut at 200 characters,
+     * so the two are compared by their letters and digits. A transcript whose newest Bot line is the
+     * list's already holds that turn. One that isn't is a turn that ended just before opening, which
+     * the store can be a beat behind on, or a line this check can't match (a turn that only drew, or
+     * a reply whose list line drops other text, such as link addresses and list numbers): read for
+     * as before, which is safe.
+     */
+    const openedWith = (activity: ChannelActivitySignature) =>
+      rosterLineMatches(
+        runReply(agentRef.current.messages, new Set(), authoredComponents())
+          ?.text ?? "",
+        activity.text,
+      );
     void (async () => {
       await joinGatePromise;
       if (
         !cancelled &&
         initialActivity &&
-        !sameActivity(selfReportedBotActivity.current, initialActivity)
+        !sameActivity(selfReportedBotActivity.current, initialActivity) &&
+        !openedWith(initialActivity)
       ) {
         pull();
       }
@@ -1387,6 +1650,60 @@ export function ChannelChat({
     wasCarryingOn.current = carryingOn;
   }, [carryingOn]);
 
+  /*
+   * THE FOURTH: THE SERVER IS CARRYING THE PERSON'S TURN ON, between one run and the next too. It
+   * hands a long turn to a fresh run when the server running it leaves, and in the moment between
+   * the two no run is going, so a page that asked then heard "no run" and its turn ended: no working
+   * dot, and a page that slept through it said "The Bot stopped before it finished". The
+   * conversation's work says so the whole time (`turn`, `carried-turn.ts`), so while it does the
+   * conversation reads as working, Stop is up, and the next run is joined as it appears.
+   */
+  /*
+   * The carried turn the person stopped from here, by its work's key: over at once on this screen,
+   * though the conversation's work still lists it until the server's word that it is gone arrives.
+   */
+  const [stoppedCarried, setStoppedCarried] = useState<string | null>(null);
+  const carriedByServer = serverCarriesTurn(
+    channel.work?.filter((entry) => entry.key !== stoppedCarried),
+  );
+  const carriedByServerRef = useRef(carriedByServer);
+  carriedByServerRef.current = carriedByServer;
+  useEffect(() => {
+    if (!carriedByServer || !isReady) return;
+    let current = true;
+    void (async () => {
+      // After the conversation has joined its thread: a run going then streams in through that join.
+      await joinedPromise;
+      while (current && carriedByServerRef.current) {
+        const target = agentRef.current;
+        // This tab's own turn follows the server's runs itself (`deliver`), and a join is a run.
+        const busyHere = turnsRef.current > 0 || target.isRunning;
+        const followed = busyHere
+          ? null
+          : await followServerTurn({
+              agent: target,
+              conversationId: channel.id,
+              heard: null,
+              join: () =>
+                whileObserved(target, () =>
+                  copilotkit.connectAgent({ agent: target }),
+                ),
+              quietMs: quietRunPeriod.ms,
+              stopped: () =>
+                !current || !carriedByServerRef.current || turnsRef.current > 0,
+            });
+        if (followed !== null) continue;
+        // Nothing going yet: asked again when the conversation's work next changes, or after a while.
+        await nextRosterChange(quietRunPeriod.ms);
+      }
+      // The turn is over: what the server wrote is read, its answer among it.
+      if (current) pullHistoryRef.current?.();
+    })();
+    return () => {
+      current = false;
+    };
+  }, [carriedByServer, isReady, channel.id, copilotkit, joinedPromise]);
+
   /**
    * Tell the roster what was just said. Failures here must not block the conversation.
    */
@@ -1439,6 +1756,20 @@ export function ChannelChat({
     return false;
   };
 
+  /**
+   * The thread being replayed to learn how a turn this browser stopped hearing went on: a run that
+   * failed along the way is not the turn's last word, and is not said as one (see `fail`).
+   */
+  const quietReplay = useRef(false);
+
+  /** Join the thread on this agent, as a turn of its own: see `carried-turn.ts`. */
+  const joinThread = (target: typeof agent) => () =>
+    whileObserved(target, () => copilotkit.connectAgent({ agent: target }));
+
+  /** Whether the person stopped the turn since `stops`, or left the conversation it is in. */
+  const stoppedSince = (stops: number) => () =>
+    stopEpoch.current !== stops || !onScreen.current;
+
   /** The reply a read-back put right, for the roster, as a run's end would have told it. */
   const reportReadBack = (target: typeof agent) => {
     const reply = runReply(
@@ -1482,23 +1813,28 @@ export function ChannelChat({
     // used throughout, so the message, the repair and the run cannot land on two different agents.
     // Give initial voice history time to restore, while keeping ordinary chat usable on failure.
     setVoiceContextNotice(null);
+    // The first message of a conversation just made here: no call has been had in it (`fresh`).
+    const first = firstOfFresh.current;
+    firstOfFresh.current = false;
     let voiceHistoryTimer: ReturnType<typeof setTimeout> | undefined;
-    const priorCalls = await Promise.race([
-      loadVoiceArchive(channel.id),
-      new Promise<never>((_resolve, reject) => {
-        voiceHistoryTimer = setTimeout(
-          () => reject(new Error("Voice history timed out")),
-          2000,
-        );
-      }),
-    ])
-      .catch(() => {
-        setVoiceContextNotice(
-          "Couldn’t bring in what was said on the call. You may need to repeat it.",
-        );
-        return cachedVoiceArchive(channel.id);
-      })
-      .finally(() => clearTimeout(voiceHistoryTimer));
+    const priorCalls = first
+      ? []
+      : await Promise.race([
+          loadVoiceArchive(channel.id),
+          new Promise<never>((_resolve, reject) => {
+            voiceHistoryTimer = setTimeout(
+              () => reject(new Error("Voice history timed out")),
+              2000,
+            );
+          }),
+        ])
+          .catch(() => {
+            setVoiceContextNotice(
+              "Couldn’t bring in what was said on the call. You may need to repeat it.",
+            );
+            return cachedVoiceArchive(channel.id);
+          })
+          .finally(() => clearTimeout(voiceHistoryTimer));
     const target = agentRef.current;
     /*
      * A call this screen holds no answer for is answered from the stored thread first, so the repair
@@ -1523,6 +1859,8 @@ export function ChannelChat({
     turnFailure.current = null;
     turnRefused.current = false;
     stoppedHere.current = false;
+    // A Stop from here on is this turn's: it ends any run of the server's the turn follows.
+    const stops = stopEpoch.current;
     reportedReply.current = null;
     assistantMessagesBeforeRun.current = new Set(
       target.messages
@@ -1585,6 +1923,8 @@ export function ChannelChat({
       },
       // Live on the thread now: if this chat has closed, the one open for this conversation joins the run.
       onRunStartedEvent: () => {
+        // The server has the conversation's first message: no page needs to put it back now.
+        if (first) forgetFirstMessage(channel.id);
         if (!onScreen.current) runStartedAway(channel.id);
       },
     });
@@ -1608,12 +1948,31 @@ export function ChannelChat({
          * Stop, for good. A browser step taken between this turn's runs is quiet of its own, so the
          * watch covers one run at a time.
          */
-        const quiet = watchQuietRun({
-          ask: () => askRunLiveness(channel.id),
-          quietMs: quietRunPeriod.ms,
-        });
         // The run this browser last heard start, to ask how it ended if its end is never heard.
         let heardRunId: string | null = null;
+        // A run the server carries this turn on in, found going while this one had gone quiet.
+        let carried: string | null = null;
+        const quiet = watchQuietRun({
+          /*
+           * A RUN GOING THAT IS NOT THE ONE HEARD HERE is the server carrying the turn on in a run of
+           * its own (`carried-turn.ts`). This run's stream won't bring it, so the watch ends and the
+           * turn follows that run below.
+           */
+          ask: async () => {
+            const going = await askRunGoing(channel.id);
+            if (
+              going.liveness === "live" &&
+              going.runId &&
+              heardRunId !== null &&
+              going.runId !== heardRunId
+            ) {
+              carried = going.runId;
+              return "over";
+            }
+            return going.liveness;
+          },
+          quietMs: quietRunPeriod.ms,
+        });
         const hearing = target.subscribe({
           /*
            * The browser starting the turn's next run (with a step's result) ends the rest, before a
@@ -1663,41 +2022,173 @@ export function ChannelChat({
            * is reported as a failure of its own.
            */
           stoppedHere.current = true;
-          try {
-            copilotkit.stopAgent({ agent: target });
-          } catch {
-            // Nothing left to stop.
+          // Not while the server carries the turn on: a stop reaches the thread's run, which is its.
+          if (carried === null) {
+            try {
+              copilotkit.stopAgent({ agent: target });
+            } catch {
+              // Nothing left to stop.
+            }
           }
-          void target.detachActiveRun().catch(() => undefined);
+          const detached = target.detachActiveRun().catch(() => undefined);
           awaitingReply.current = false;
           // What the thread holds is what was saved: read back when the runtime can be asked.
           if (ended === "over") {
-            const ending = heardRunId
+            let ending = heardRunId
               ? await askRunEnding(channel.id, heardRunId)
               : "unknown";
+            /*
+             * A TURN THE SERVER CARRIED ON IS FOLLOWED, AND JUDGED BY ITS LAST RUN. The server runs a
+             * Bot's computer steps itself and carries a turn on in runs of its own: past a run's step
+             * limit or deadline, or on another server after the one running it stopped. A phone that
+             * slept through that woke to "The Bot stopped before it finished" under a turn the server
+             * had carried to its answer, because the run it last heard was the one that stopped. So
+             * when a run is going, or the run heard here did not finish, the thread is joined: what
+             * ran meanwhile is replayed, a run still going streams in to its end, and the turn is
+             * judged by the last run the thread holds. What a replay says of a run that failed
+             * along the way is not this turn's last word, so it is not said (`quietReplay`).
+             */
+            if (carried !== null || ending !== "finished") {
+              await detached;
+              quietReplay.current = true;
+              let last: string | null = null;
+              try {
+                const replayed = await followCarriedRun({
+                  agent: target,
+                  join: joinThread(target),
+                  conversationId: channel.id,
+                  quietMs: quietRunPeriod.ms,
+                });
+                last = replayed.runId;
+                if (
+                  replayed.ended === "joined" &&
+                  !turnAnswered(target.messages)
+                )
+                  last =
+                    (await followServerTurn({
+                      agent: target,
+                      conversationId: channel.id,
+                      heard: last ?? heardRunId,
+                      join: joinThread(target),
+                      quietMs: quietRunPeriod.ms,
+                      stopped: stoppedSince(stops),
+                    })) ?? last;
+              } finally {
+                quietReplay.current = false;
+              }
+              last ??= carried;
+              if (last !== null && last !== heardRunId)
+                ending = await askRunEnding(channel.id, last);
+            }
             const whole = await readBackFromThread(target, existingMessageIds);
             if (whole) reportReadBack(target);
+            const unrun = unansweredToolCalls(target.messages).size > 0;
             /*
              * A RUN THAT FINISHED IS SHOWN AS FINISHED, though its end never reached here. Its reply
              * is the one read back whole from the thread, and nothing is left for this browser to
              * do. A run that stopped part way, or one the server can't say about, keeps the notice
              * and its Carry on. See `askRunEnding`.
              */
-            if (
-              ending === "finished" &&
-              whole &&
-              unansweredToolCalls(target.messages).size === 0
-            )
-              break;
+            if (ending === "finished" && whole && !unrun) break;
+            /*
+             * A RUN THAT FINISHED ON A STEP THIS BROWSER NEVER HEARD IS CARRIED ON, ONCE. Found on
+             * OpenBot Cloud, in a phone's web view, on a long task at the highest reasoning level:
+             * the Bot's run finished on the server by handing this browser a command to run on its
+             * computer, as every run does that needs the computer. The phone was not listening when
+             * it ended, so the command never ran, and the turn ended "The Bot stopped before it
+             * finished". Carry on brought the next run, which ended on the next command the same way,
+             * three times in one conversation. The run did nothing wrong and this browser was never
+             * asked: the step is answered as not run and the Bot asked again, as the person pressing
+             * Carry on did, and as a run whose stream broke here is. Never more than once a turn: a
+             * second time keeps the notice and its Carry on.
+             */
+            if (ending === "finished" && whole && unrun && !carriedOn) {
+              await detached;
+              const answered = repairUnansweredToolCalls(target.messages);
+              if (answered !== target.messages)
+                target.setMessages(answered as typeof target.messages);
+              stoppedHere.current = false;
+              continue;
+            }
           }
+          /*
+           * Nor while the server says it is still carrying the turn on, between one run and the next:
+           * the conversation follows its next run as it appears (`carriedByServer`).
+           */
+          if (carriedByServerRef.current) break;
           setRunError({
             message: ended === "over" ? RUN_ENDED_UNHEARD : RUN_UNREACHABLE,
           });
           break;
         }
+        /*
+         * A STREAM LOST HERE IS NOT A TURN THAT FAILED while the server still has a run going. A
+         * phone's connection drops, or the server the run's events came through leaves, and this
+         * run's stream ends in an error while the run goes on, or another server carries the turn on
+         * in a run of its own. When the server says a run is going, the failure is not said: the
+         * turn rejoins the thread and follows that run, and its own end says how the turn went.
+         */
+        if (
+          turnFailure.current !== null &&
+          !turnRefused.current &&
+          !stoppedHere.current &&
+          (await askRunGoing(channel.id)).liveness === "live"
+        ) {
+          const lost = turnFailure.current;
+          turnFailure.current = null;
+          awaitingReply.current = false;
+          setRunError((shown) => (shown?.message === lost ? null : shown));
+          await followServerTurn({
+            agent: target,
+            conversationId: channel.id,
+            heard: null,
+            join: joinThread(target),
+            quietMs: quietRunPeriod.ms,
+            stopped: stoppedSince(stops),
+          });
+        }
+        /*
+         * A RUN THAT ENDED BEFORE THE BOT ANSWERED MAY NOT BE THE END OF THE TURN. The server carries
+         * a turn on in a run of its own when the server running it leaves (`carried-turn.ts`), and
+         * this run's stream ends without it, on the last step it answered. The turn follows that
+         * run here, the working dot staying on, its steps and its answer streaming in. Not a turn
+         * waiting on the person, whose next run starts only when they answer. Asked once, at once: a
+         * turn that ended without words is not held up waiting to see whether one comes. When no
+         * run is going, the thread is read again once the turn is over, for anything the server
+         * wrote that this stream did not bring.
+         */
+        if (
+          endsOnStep(target.messages) &&
+          !streamBroke.current &&
+          turnFailure.current === null &&
+          !stoppedHere.current &&
+          !waitsOnPerson(target)
+        ) {
+          await followServerTurn({
+            agent: target,
+            conversationId: channel.id,
+            heard: heardRunId,
+            join: joinThread(target),
+            quietMs: quietRunPeriod.ms,
+            stopped: stoppedSince(stops),
+          });
+        }
         if (!streamBroke.current || turnFailure.current !== null) break;
         streamBroke.current = false;
         awaitingReply.current = false;
+        /*
+         * The server may still be running the run whose stream broke here, or carrying the turn on
+         * in its next one: followed to its end before the thread is read back, so a turn still going
+         * is not answered as cut off and asked again beside the server's own run.
+         */
+        await followServerTurn({
+          agent: target,
+          conversationId: channel.id,
+          heard: null,
+          join: joinThread(target),
+          quietMs: quietRunPeriod.ms,
+          stopped: stoppedSince(stops),
+        });
         const whole = await readBackFromThread(target, existingMessageIds);
         if (whole) reportReadBack(target);
         const unrun = unansweredToolCalls(target.messages).size > 0;
@@ -1803,7 +2294,9 @@ export function ChannelChat({
     if (
       turnsRef.current > 0 ||
       agentRef.current.isRunning ||
-      turnsGoingAway(channel.id) > 0
+      turnsGoingAway(channel.id) > 0 ||
+      // And while the server carries the last turn on: the next message waits for it to be over.
+      carriedByServerRef.current
     ) {
       // Its own kind, so a drained queue tries again once the Bot is free (`StillWorkingError`).
       throw new StillWorkingError();
@@ -1874,6 +2367,7 @@ export function ChannelChat({
       /** The server refused the run for the person; see `turnRefused`. */
       refused = false,
     ) => {
+      if (quietReplay.current) return;
       if (!awaitingReply.current && !(laterRun && turnsRef.current > 0)) return;
       awaitingReply.current = false;
       // Both halves of one fact: the sentence the transcript shows, and the reason `deliver` throws
@@ -1913,7 +2407,8 @@ export function ChannelChat({
           stoppedReason(event?.message),
           true,
           undefined,
-          refusedForPerson(event?.message),
+          // Or a turn the server keeps as refused: its Bot's engine couldn't take it.
+          refusedForPerson(event?.message) || refusedRun(event),
         );
       },
       onRunFailed: ({ error }) => {
@@ -1937,7 +2432,11 @@ export function ChannelChat({
          * See `laterRunFailure`.
          */
         if (!awaitingReply.current && turnsRef.current > 0) {
-          if (stoppedHere.current) return;
+          /*
+           * Nor a turn already refused in its RUN_ERROR's words: Intelligence's client fails the run
+           * after one, and said again here it was the refusal a second time, as the turn's last line.
+           */
+          if (stoppedHere.current || turnRefused.current) return;
           const said = laterRunFailure(error);
           // A request refused may be OpenBot holding off, which the server is asked about first.
           if (said)
@@ -2098,6 +2597,27 @@ export function ChannelChat({
     stoppedHere.current = true;
     stopEpoch.current++;
     copilotkit.stopAgent({ agent });
+    /*
+     * A TURN THE SERVER IS CARRYING ON IS STOPPED WHEREVER IT IS. Between one run and the next no run
+     * is going, so the Stop above reaches nothing, and the turn would go on with the person having
+     * pressed Stop. The server's stop for the thread takes it off its queue, and reaches a run going
+     * too. The conversation stops reading as working at once; a Stop the server refused says so.
+     */
+    const carried = channel.work?.find(
+      (entry) => isTurnWork(entry) && entry.key !== stoppedCarried,
+    );
+    if (!carried || !agent.threadId) return;
+    setStoppedCarried(carried.key);
+    const routed =
+      (agent as { runtimeAgentId?: string }).runtimeAgentId ?? agent.agentId;
+    if (!routed) return;
+    // The runtime's refusal is written for a program ("Thread access denied"): a person reads theirs.
+    stopCarriedTurn(routed, agent.threadId).catch(() => {
+      setStoppedCarried((stopped) =>
+        stopped === carried.key ? null : stopped,
+      );
+      setRunError({ message: STOP_FAILED });
+    });
   };
 
   /**
@@ -2143,9 +2663,21 @@ export function ChannelChat({
    * in the thread, so without the record a reload lost the message and the notice both.
    */
   const storedRefusals = useQuery(refusedTurnsQueryOptions(channel.id)).data;
+  /*
+   * THE STORED COPY IS FOR READING ONLY. While it is drawn the join is still replaying onto an agent
+   * it emptied, or the history that replaces it is still being read, and anything that changed the
+   * agent then would be changed again: a message set on it has its replayed text appended twice. So
+   * until the history is on the agent, or a turn still going takes the screen (`onAnswering`), what
+   * the transcript draws is drawn as it is outside a conversation, with nothing in it that adds a
+   * turn; the question waiting on the person can't be answered yet; and a hand-back is not checked
+   * against a half-replayed thread. The composer waits on its own: the replay holds the agent
+   * running, so what is typed meanwhile is queued, and a turn waits for the join gate.
+   */
+  const earlyShown = earlyHistory !== null;
   // Every render, as the transcript's messages always were: the agent's list changes in place.
   const refused = withRefusedTurns(
-    transcriptMessages(agent.messages, seed),
+    // The stored history while the join replays it, which empties the agent: see `earlyHistory`.
+    transcriptMessages(earlyShown ? earlyHistory : agent.messages, seed),
     storedRefusals ?? [],
   );
   for (const [messageId, sentence] of refusals)
@@ -2158,7 +2690,7 @@ export function ChannelChat({
       agentId={localAgentId}
       threadId={channel.threadId}
     >
-      <ConversationProvider ask={askFromComponent}>
+      <ConversationProvider ask={earlyShown ? null : askFromComponent}>
         <div className="relative isolate flex min-h-0 min-w-0 flex-1 flex-col">
           <VoiceCallWidget
             call={call}
@@ -2195,6 +2727,7 @@ export function ChannelChat({
             channelId={channel.id}
             // An unsent reply stays with this conversation when somebody looks at another one.
             draftKey={`conversation:${channel.id}`}
+            composerOpening={composerOpenings}
             attachmentLimits={attachmentLimits}
             starterSuggestions={
               channel.agentIds.length === 1 ? (
@@ -2207,6 +2740,7 @@ export function ChannelChat({
                     agent.isRunning ||
                     turnsInFlight > 0 ||
                     carryingOn ||
+                    carriedByServer ||
                     Boolean(question) ||
                     call.active ||
                     runModel.saving
@@ -2226,13 +2760,16 @@ export function ChannelChat({
             /*
              * THE TURN, not the run. `say` waits for the runtime agent and the join before a run starts,
              * and `agent.isRunning` alone leaves that gap unmarked — which is the one moment the
-             * "Thinking" line exists for. Same value as `pending`, deliberately.
+             * "Thinking" line exists for. Same value as `pending`, except while the join replays
+             * history (`replaying`): the agent reports itself running then with nothing running, and
+             * the stored copy drawn meanwhile is a conversation at rest, not a turn going.
              */
             busy={
-              agent.isRunning ||
+              (agent.isRunning && !replaying) ||
               turnsInFlight > 0 ||
               turnsAway > 0 ||
-              carryingOn
+              carryingOn ||
+              carriedByServer
             }
             // The `/` menu exposes only skills granted to this Bot.
             commands={skillCommands}
@@ -2258,6 +2795,7 @@ export function ChannelChat({
                 <QuestionNotice
                   avatarSeed={botSeed}
                   botName={botName}
+                  disabled={earlyShown}
                   onAnswered={answerTo}
                   question={question}
                 />
@@ -2276,7 +2814,7 @@ export function ChannelChat({
                 <HandoffResumeNotice
                   botId={runtimeAgentId}
                   agent={agent}
-                  ready={isReady && !restoring && channel.active}
+                  ready={isReady && !restoring && !earlyShown && channel.active}
                   run={async () => {
                     setRunsInFlight((count) => count + 1);
                     try {
@@ -2371,7 +2909,8 @@ export function ChannelChat({
               agent.isRunning ||
               turnsInFlight > 0 ||
               turnsAway > 0 ||
-              carryingOn
+              carryingOn ||
+              carriedByServer
             }
             /*
              * A channel outlives its turns, so it is the screen where waiting is worth offering. A
@@ -2381,6 +2920,14 @@ export function ChannelChat({
              */
             queueWhileBusy
             restoring={historyLoading}
+            /*
+             * Read-only, because one place that stops every renderer from acting on the stored copy
+             * is safer than guarding each one: an A2UI surface's button sends its press straight to
+             * `runAgent`, past the guards above, and would detach the replay and start a run the join
+             * has not confirmed. Only the stored copy's rows: what is queued meanwhile can still be
+             * taken back. This lasts at most until the join ends or a live turn takes the screen.
+             */
+            readOnly={earlyShown}
             /*
              * The run, not the turn. Stop reaches a run through the core's abort controller, and that
              * controller does not exist until `say` has finished waiting for the runtime agent — so
@@ -2392,7 +2939,12 @@ export function ChannelChat({
              * Nor while the join replays history (`replaying`): the agent reports itself running then
              * with nothing running.
              */
-            stoppable={(agent.isRunning && !replaying) || runsInFlight > 0}
+            stoppable={
+              (agent.isRunning && !replaying) ||
+              runsInFlight > 0 ||
+              // A turn the server carries on, between its runs too: see `stopTask`.
+              carriedByServer
+            }
             /*
              * At the END OF THE TRANSCRIPT rather than above the composer, which is where this used to
              * be. A turn that ends without an answer leaves a gap exactly where the reply was going to
@@ -2443,7 +2995,8 @@ export function ChannelChat({
              * finds them mid-turn waits and is tried again.
              */
             working={
-              agent.isRunning || turnsInFlight > 0 ? null : (
+              // Not hidden by a replay, which runs nothing: see `busy`.
+              (agent.isRunning && !replaying) || turnsInFlight > 0 ? null : (
                 <>
                   {readingAnswer ? (
                     <ProgressRow

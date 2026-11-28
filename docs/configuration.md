@@ -131,7 +131,7 @@ model ignores.
 | `GOOGLE_API_KEY`     | unset                              | Google key when `BOT_PROVIDER=google`.                              |
 | `GOOGLE_GENERATIVE_AI_BASE_URL` | unset                   | Google-compatible endpoint that key is spent against.               |
 | `CLAUDE_CODE_OAUTH_TOKEN`, `CHATGPT_AUTH_FILE` | unset    | A model plan sign-in in place of a key: the Anthropic token from `claude setup-token`, or the file a signed-in ChatGPT plan writes. Set one, not both. The built-in Bots then run on the plan through the installed harness that holds it (`agent-claude-sdk` for Claude, `agent-langgraph-agui` for ChatGPT), named by `PICKED_HARNESS_IMAGE` and `PICKED_HARNESS_URL`, with `MANAGED_AGENT_TOKEN`. A ChatGPT plan can instead name that harness by `CHATGPT_PLAN_HARNESS_URL` (and `CHATGPT_PLAN_HARNESS_TOKEN`, which defaults to `MANAGED_AGENT_TOKEN`), which is how the TypeScript LangGraph engine reaches it too. OpenBot Desktop signs in to a ChatGPT plan with OpenAI's Sign in with ChatGPT plan usage and runs `agent-openai-agents` (the OpenAI Agents SDK) as the plan's Bot and as its harness, at `CHATGPT_PLAN_HARNESS_URL`; `CHATGPT_AUTH_FILE` then holds that sign-in's credential record, which the engine renews. A server that runs the ChatGPT sign-in itself keeps `agent-langgraph-agui` for it. The server refuses to start with both set, or with either set and that harness missing. OpenBot Desktop writes these itself; see below. |
-| `BOT_MODEL`          | the Bot's row in the spec file   | Model for whichever Bot is starting. Unset, it comes from that Bot's row in [the provider spec file](#the-provider-spec-file); the provider fallbacks are `gpt-5.5`, `claude-sonnet-5-5`, and `gemini-2.5-flash`. Set, it is the default for built-in Bots and the picked harness while the credential lists it; a person can still pick another in the composer. Unset, the [model list](#the-model-list) chooses the default. |
+| `BOT_MODEL`          | the Bot's row in the spec file   | Model for whichever Bot is starting. Unset, it comes from that Bot's row in [the provider spec file](#the-provider-spec-file); the provider fallbacks are `gpt-5.5`, `claude-sonnet-5-5`, and `gemini-3.8-flash`. Set, it is the default for built-in Bots and the picked harness while the credential lists it; a person can still pick another in the composer. Unset, the [model list](#the-model-list) chooses the default. |
 | `CHATGPT_CODEX_CLIENT_VERSION` | `0.167.0` | The Codex client version the LangGraph harness names when it reads a ChatGPT plan's model list. Change it only if the plan's list comes back empty after a Codex release. |
 | `OPENBOT_MODEL_CAPABILITIES_URL` | `https://models.dev/api.json` | Where the model list reads each model's thinking levels, line and price when the provider's own listing does not say. `off` reads none: providers that publish their own (Anthropic, xAI, a ChatGPT plan) still show thinking levels, and the default falls back to the configured model. See [The model list](#the-model-list). |
 | `AGENT_STALL_TIMEOUT_MS` | unset (off)                    | How long a Bot's stream may produce nothing before the turn is ended for it, in milliseconds. A value that is not a whole number of zero or more refuses to start. |
@@ -838,6 +838,8 @@ some of a provider's variables and not all of them stops the server at start-up 
 | `TWILIO_FROM_NUMBER`        | The Twilio number OpenBot sends from.                                                                                                                                                                                                              |
 | `EXPO_PROJECT_ID`           | The native app's EAS project id, a UUID. Switches on push notifications and sign-in from the native app (without it, the server does not trust the app's `openbotmobile://` sign-in redirect). A device registers only when the app reports this same project id; any other value is refused. A value that is not a UUID stops the server at start-up.                  |
 | `EXPO_ACCESS_TOKEN`         | Optional. Sent as `Authorization: Bearer` on every request to Expo's push service; without it those requests carry no token.                                                                                                                       |
+| `WEB_PUSH_VAPID_PUBLIC_KEY`, `WEB_PUSH_VAPID_PRIVATE_KEY` | Optional, both or neither. The VAPID key pair (RFC 8292) browsers subscribe to push notifications with, in URL-safe base64. Unset, the server makes a pair the first time a browser asks for the key and keeps it in its database, sealed with `KEY_ENCRYPTION_KEY`. Set them only where several databases must sign with one key. One without the other, or a pair that does not match, stops the server at start-up. |
+| `WEB_PUSH_SUBJECT`          | Optional. Who the browsers' push services may contact about this deployment's notifications: an `https:` URL or a `mailto:` address. Unset, an `https` `OPENBOT_PUBLIC_URL`, or OpenBot's own site. Anything else stops the server at start-up. |
 
 With SMS on, point the Twilio number's incoming-message webhook at
 `<DELIVERY_PUBLIC_URL>/api/delivery/webhooks/sms`. OpenBot passes
@@ -848,6 +850,11 @@ The native app in `mobile/` reads two variables of its own when it is built, fro
 `EXPO_PUBLIC_SERVER_URL`, the deployment's public URL (required, `https` outside development, no
 credentials or query string), and `EXPO_PUBLIC_EAS_PROJECT_ID`, the same project id as
 `EXPO_PROJECT_ID` above.
+
+Push to browsers needs nothing set: a person turns notifications on in the web app, in their browser,
+and from then on their Bots' replies, questions and approvals reach that browser the way the person's
+notification settings route push. On iPhone and iPad a browser gets them only from OpenBot added to
+the Home Screen, on iOS or iPadOS 16.4 or later.
 
 ## Inbound email triggers
 
